@@ -198,6 +198,7 @@ class ConfigSanitizer:
         "caption_prefix": str,
         "caption_suffix": str,
         "custom_attributes": dict,
+        "recursive": bool,
         "resize_interpolation": str,
     }
     # DO means DropOut
