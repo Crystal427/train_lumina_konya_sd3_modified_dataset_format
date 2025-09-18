@@ -435,6 +435,8 @@ class BaseSubset:
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
     ) -> None:
+        if image_dir is not None:
+            image_dir = os.path.expanduser(image_dir)
         self.image_dir = image_dir
         self.recursive = recursive
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
