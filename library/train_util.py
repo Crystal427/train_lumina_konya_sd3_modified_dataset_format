@@ -14,6 +14,7 @@ import shutil
 import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from collections.abc import Mapping
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 import glob
 import math
@@ -407,6 +408,16 @@ class AugHelper:
 
 
 class BaseSubset:
+    @staticmethod
+    def _normalize_custom_attributes(value):
+        if isinstance(value, Mapping):
+            return {k: BaseSubset._normalize_custom_attributes(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [BaseSubset._normalize_custom_attributes(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(BaseSubset._normalize_custom_attributes(v) for v in value)
+        return value
+
     def __init__(
         self,
         image_dir: Optional[str],
@@ -460,7 +471,10 @@ class BaseSubset:
         self.token_warmup_min = token_warmup_min  # step=0におけるタグの数
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
-        self.custom_attributes = custom_attributes if custom_attributes is not None else {}
+        if custom_attributes is None:
+            self.custom_attributes = {}
+        else:
+            self.custom_attributes = self._normalize_custom_attributes(custom_attributes)
 
         self.img_count = 0
 
