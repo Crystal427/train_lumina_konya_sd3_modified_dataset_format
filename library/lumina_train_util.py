@@ -834,8 +834,8 @@ def get_noisy_model_input_and_timesteps(
             t = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
         else:
             t = torch.rand((bsz,), device=device)
-
-        timesteps = t * 1000.0
+        t_lumina = 1.0 - t
+        timesteps = t_lumina * 1000.0
         t = t.view(-1, 1, 1, 1)
         noisy_model_input = (1 - t) * noise + t * latents
     elif args.timestep_sampling == "shift":
