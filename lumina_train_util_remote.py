@@ -861,7 +861,8 @@ def get_noisy_model_input_and_timesteps(
     elif args.timestep_sampling == "lognorm":
         lognormal = LogNormal(loc=0, scale=0.333)
         t = lognormal.sample((int(timesteps * args.lognorm_alpha),)).to(device)
-        t = ((1 - t/t.max()) * 1000)    
+        
+        t = ((1 - t/t.max()) * 1000)
         t = t.view(-1, 1, 1, 1)
         noisy_model_input = (1 - t) * noise + t * latents
     else:
@@ -1058,14 +1059,21 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         "--timestep_sampling",
         choices=["sigma", "uniform", "sigmoid", "shift", "lognorm", "nextdit_shift"],
         default="shift",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and NextDIT.1 shifting. Default is 'shift'."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、NextDIT.1のシフト。デフォルトは'shift'です。",
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, lognorm, shift of sigmoid and NextDIT.1 shifting. Default is 'shift'."
+        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid, lognorm、sigmoidのシフト、NextDIT.1のシフト。デフォルトは'shift'です。",
     )
     parser.add_argument(
         "--sigmoid_scale",
         type=float,
         default=1.0,
         help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"の場合のみ有効）。',
+    )
+
+    parser.add_argument(
+        "--lognorm_alpha",
+        type=float,
+        default=0.75,
+        help='Alpha factor for distribute timestep to the center/early (only used when timestep-sampling is "lognorm"). / 中心／早期へのタイムステップ分配のアルファ係数（timestep-samplingが"lognorm"の場合のみ有効）。',
     )
     parser.add_argument(
         "--model_prediction_type",
@@ -1103,10 +1111,4 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=None,
         help="Batch size to use for sampling, defaults to --training_batch_size value. Sample batches are bucketed by width, height, guidance scale, and seed / サンプリングに使用するバッチサイズ。デフォルトは --training_batch_size の値です。サンプルバッチは、幅、高さ、ガイダンススケール、シードによってバケット化されます",
-    )
-    parser.add_argument(
-        "--lognorm_alpha",
-        type=float,
-        default=0.75,
-        help='Alpha factor for distribute timestep to the center/early (only used when timestep-sampling is "lognorm"). / 中心／早期へのタイムステップ分配のアルファ係数（timestep-samplingが"lognorm"の場合のみ有効）。',
     )
