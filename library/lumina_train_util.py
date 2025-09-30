@@ -855,15 +855,15 @@ def get_noisy_model_input_and_timesteps(
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
         t = time_shift(mu, 1.0, t)
 
-        timesteps = 1 - t * 1000.0
+        timesteps = t * 1000.0
         t = t.view(-1, 1, 1, 1)
         noisy_model_input = (1 - t) * noise + t * latents
     elif args.timestep_sampling == "lognorm":
         lognormal = LogNormal(loc=0, scale=0.333)
         t = lognormal.sample((int(timesteps * args.lognorm_alpha),)).to(device)
-        t = ((1 - t/t.max()) * 1000)    
+        t = ((1 - t/t.max()) * 1000)   ##反转至1附近
         t = t.view(-1, 1, 1, 1)
-        noisy_model_input = (1 - t) * noise + t * latents
+        noisy_model_input = (1 - t) * noise + t * latents  ##反转回去
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
