@@ -867,25 +867,64 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             # astra dataset dropout
             if subset.astra_dataset_dropout_rate > 0 and random.random() < subset.astra_dataset_dropout_rate:
+                # Tags to preserve even after dropout
+                preserve_tags = [
+                    "newest", "mid", "early", "oldest",
+                    "year 2023", "year 2024", "year 2025",
+                    "masterpiece", "best quality", "bad quality", "worst quality"
+                ]
+                
                 astra_prefix = "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags."
                 if caption.startswith(astra_prefix):
-                    # Drop content after "Drawn by" and the first comma
+                    # Drop content after "Drawn by" and the first comma, but preserve certain tags
                     drawn_by_idx = caption.find("Drawn by")
                     if drawn_by_idx != -1:
                         # Find the first comma after "Drawn by"
                         comma_idx = caption.find(",", drawn_by_idx)
                         if comma_idx != -1:
-                            # Keep everything up to (but not including) the comma
-                            caption = caption[:comma_idx]
+                            # Extract the part before and after the comma
+                            kept_part = caption[:comma_idx]
+                            dropped_part = caption[comma_idx + 1:]  # Skip the comma itself
+                            
+                            # Extract preserved tags from dropped part
+                            preserved_tags_found = []
+                            if dropped_part:
+                                # Split by comma and check each tag
+                                tags = [tag.strip() for tag in dropped_part.split(",")]
+                                for tag in tags:
+                                    if tag.lower() in [pt.lower() for pt in preserve_tags]:
+                                        preserved_tags_found.append(tag)
+                            
+                            # Reconstruct caption with preserved tags
+                            if preserved_tags_found:
+                                caption = kept_part + ", " + ", ".join(preserved_tags_found)
+                            else:
+                                caption = kept_part
                 else:
-                    # Drop content after "Drawn by" and the first newline
+                    # Drop content after "Drawn by" and the first newline, but preserve certain tags
                     drawn_by_idx = caption.find("Drawn by")
                     if drawn_by_idx != -1:
                         # Find the first newline after "Drawn by"
                         newline_idx = caption.find("\n", drawn_by_idx)
                         if newline_idx != -1:
-                            # Keep everything up to (but not including) the newline
-                            caption = caption[:newline_idx]
+                            # Extract the part before and after the newline
+                            kept_part = caption[:newline_idx]
+                            dropped_part = caption[newline_idx + 1:]  # Skip the newline itself
+                            
+                            # Extract preserved tags from dropped part
+                            preserved_tags_found = []
+                            if dropped_part:
+                                # Split by comma and check each tag
+                                tags = [tag.strip() for tag in dropped_part.split(",")]
+                                for tag in tags:
+                                    if tag.lower() in [pt.lower() for pt in preserve_tags]:
+                                        preserved_tags_found.append(tag)
+                            
+                            # Reconstruct caption with preserved tags
+                            if preserved_tags_found:
+                                caption = kept_part + "\n" + ", ".join(preserved_tags_found)
+                            else:
+                                caption = kept_part
             
             # process wildcards
             if subset.enable_wildcard:
