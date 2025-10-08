@@ -436,6 +436,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        astra_dataset_dropout_rate: float,
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -465,6 +466,7 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        self.astra_dataset_dropout_rate = astra_dataset_dropout_rate
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -507,6 +509,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        astra_dataset_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -536,6 +539,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            astra_dataset_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -580,6 +584,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        astra_dataset_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -609,6 +614,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            astra_dataset_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -649,6 +655,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        astra_dataset_dropout_rate,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -678,6 +685,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            astra_dataset_dropout_rate,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -857,6 +865,28 @@ class BaseDataset(torch.utils.data.Dataset):
         if is_drop_out:
             caption = ""
         else:
+            # astra dataset dropout
+            if subset.astra_dataset_dropout_rate > 0 and random.random() < subset.astra_dataset_dropout_rate:
+                astra_prefix = "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags."
+                if caption.startswith(astra_prefix):
+                    # Drop content after "Drawn by" and the first comma
+                    drawn_by_idx = caption.find("Drawn by")
+                    if drawn_by_idx != -1:
+                        # Find the first comma after "Drawn by"
+                        comma_idx = caption.find(",", drawn_by_idx)
+                        if comma_idx != -1:
+                            # Keep everything up to (but not including) the comma
+                            caption = caption[:comma_idx]
+                else:
+                    # Drop content after "Drawn by" and the first newline
+                    drawn_by_idx = caption.find("Drawn by")
+                    if drawn_by_idx != -1:
+                        # Find the first newline after "Drawn by"
+                        newline_idx = caption.find("\n", drawn_by_idx)
+                        if newline_idx != -1:
+                            # Keep everything up to (but not including) the newline
+                            caption = caption[:newline_idx]
+            
             # process wildcards
             if subset.enable_wildcard:
                 # if caption is multiline, random choice one line
@@ -2586,6 +2616,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.astra_dataset_dropout_rate,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -4816,6 +4847,12 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--astra_dataset_dropout_rate",
+            type=float,
+            default=0.0,
+            help="Rate to dropout content after 'Drawn by' in astra dataset format(0.0~1.0) / astraデータセット形式で'Drawn by'後のコンテンツをdropoutする割合",
         )
 
     if support_dreambooth:

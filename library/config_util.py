@@ -71,6 +71,7 @@ class BaseSubsetParams:
     caption_dropout_rate: float = 0.0
     caption_dropout_every_n_epochs: int = 0
     caption_tag_dropout_rate: float = 0.0
+    astra_dataset_dropout_rate: float = 0.0
     token_warmup_min: int = 1
     token_warmup_step: float = 0
     custom_attributes: Optional[Dict[str, Any]] = None
@@ -206,6 +207,7 @@ class ConfigSanitizer:
         "caption_dropout_every_n_epochs": int,
         "caption_dropout_rate": Any(float, int),
         "caption_tag_dropout_rate": Any(float, int),
+        "astra_dataset_dropout_rate": Any(float, int),
     }
     # DB means DreamBooth
     DB_SUBSET_ASCENDABLE_SCHEMA = {
@@ -555,6 +557,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_dropout_rate: {subset.caption_dropout_rate}
                     caption_dropout_every_n_epochs: {subset.caption_dropout_every_n_epochs}
                     caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
+                    astra_dataset_dropout_rate: {subset.astra_dataset_dropout_rate}
                     caption_prefix: {subset.caption_prefix}
                     caption_suffix: {subset.caption_suffix}
                     color_aug: {subset.color_aug}
