@@ -3,7 +3,6 @@ import json
 import os
 import re
 import sys
-import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +25,14 @@ Image.MAX_IMAGE_PIXELS = None
 # ----------------------------
 VALID_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 YEAR_FOLDERS = ["2010s", "2017s", "2020s", "2022s", "new", "undefined", "unknown"]
+YEAR_PRIORITY = ["new", "2022s", "2020s", "2017s", "2010s", "undefined", "unknown"]
+SPECIAL_FILTER_YEARS = {"new", "2022s"}
+FILTER_FEATURE_KEYS = {
+    "monochrome",
+    "simple_background",
+    "white_background",
+    "transparent_background",
+}
 FEATURES_THRESHOLD_DEFAULT = 0.27
 
 
@@ -61,12 +68,114 @@ def splitext_lower(name: str) -> Tuple[str, str]:
     return base, ext.lower()
 
 
-def seed_from_string(s: str) -> int:
-    return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16) % (2 ** 31)
-
-
 def clamp_int(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, value))
+
+
+def get_results_entry(
+    results_json: Optional[dict],
+    year_name: str,
+    img_path: Path,
+) -> Optional[dict]:
+    if not results_json:
+        return None
+    base_name = img_path.name
+    candidates = [base_name]
+
+    def add_variant(prefix: Optional[str]) -> None:
+        if not prefix:
+            return
+        candidates.append(f"{prefix}/{base_name}")
+        candidates.append(f"{prefix}\\{base_name}")
+
+    add_variant(year_name)
+    if year_name == "new" and any(part.lower() == "augmentation" for part in img_path.parts):
+        add_variant("Augmentation")
+        add_variant(os.path.join("Augmentation", year_name))
+
+    for key in candidates:
+        if key in results_json:
+            entry = results_json.get(key)
+            if isinstance(entry, dict):
+                return entry
+    return None
+
+
+def should_defer_image(year_name: str, img_path: Path, results_json: Optional[dict]) -> bool:
+    if year_name not in SPECIAL_FILTER_YEARS:
+        return False
+    entry = get_results_entry(results_json, year_name, img_path)
+    if not entry:
+        return False
+
+    imgscore = entry.get("imgscore")
+    top_key = None
+    if isinstance(imgscore, dict):
+        numeric_scores = {}
+        for key, value in imgscore.items():
+            try:
+                numeric_scores[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if numeric_scores:
+            top_key = max(numeric_scores, key=numeric_scores.get)
+    if top_key in {"comic", "not_painting"}:
+        return True
+
+    features = entry.get("features")
+    if isinstance(features, dict):
+        for tag in FILTER_FEATURE_KEYS:
+            value = features.get(tag)
+            try:
+                if value is not None and float(value) > 0.4:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def order_artist_images(
+    images: List[Tuple[str, Path]],
+    results_json: Optional[dict],
+) -> List[Tuple[str, Path]]:
+    new_regular: List[Tuple[str, Path]] = []
+    new_filtered: List[Tuple[str, Path]] = []
+    year2022_regular: List[Tuple[str, Path]] = []
+    year2022_filtered: List[Tuple[str, Path]] = []
+    grouped: Dict[str, List[Tuple[str, Path]]] = {year: [] for year in YEAR_PRIORITY[2:]}
+    others: List[Tuple[str, Path]] = []
+
+    def sort_group(items: List[Tuple[str, Path]]) -> None:
+        items.sort(key=lambda pair: pair[1].name.lower())
+
+    for year_name, path in images:
+        filtered = should_defer_image(year_name, path, results_json)
+        if year_name == "new":
+            (new_filtered if filtered else new_regular).append((year_name, path))
+        elif year_name == "2022s":
+            (year2022_filtered if filtered else year2022_regular).append((year_name, path))
+        elif year_name in grouped:
+            grouped[year_name].append((year_name, path))
+        else:
+            others.append((year_name, path))
+
+    sort_group(new_regular)
+    sort_group(new_filtered)
+    sort_group(year2022_regular)
+    sort_group(year2022_filtered)
+    for year_list in grouped.values():
+        sort_group(year_list)
+    others.sort(key=lambda pair: (pair[0], pair[1].name.lower()))
+
+    ordered: List[Tuple[str, Path]] = []
+    ordered.extend(new_regular)
+    ordered.extend(year2022_regular)
+    ordered.extend(new_filtered)
+    ordered.extend(year2022_filtered)
+    for year in YEAR_PRIORITY[2:]:
+        ordered.extend(grouped.get(year, []))
+    ordered.extend(others)
+    return ordered
 
 
 def try_exif_transpose(img: Image.Image) -> Image.Image:
@@ -76,13 +185,68 @@ def try_exif_transpose(img: Image.Image) -> Image.Image:
         return img
 
 
-def replace_json_newlines(s: str) -> str:
-    # Convert actual newlines to literal \n for single-line serialization
-    # Do NOT escape existing backslashes to avoid producing "\\n".
-    if s is None:
-        return s
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    return s.replace("\n", "\\n")
+WHITESPACE_RE = re.compile(r"\s+")
+
+
+def strip_or_none(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def collapse_whitespace(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = WHITESPACE_RE.sub(" ", str(value))
+    text = text.strip()
+    return text if text else None
+
+
+def sanitize_prompt_line(*parts: Optional[str]) -> Optional[str]:
+    tokens: List[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        normalized = collapse_whitespace(part)
+        if normalized:
+            tokens.append(normalized)
+    if not tokens:
+        return None
+    return collapse_whitespace(" ".join(tokens))
+
+
+def extract_model_field(model_json: Optional[dict], field: str) -> Optional[str]:
+    if not model_json or not isinstance(model_json.get("image"), dict):
+        return None
+    return strip_or_none(model_json.get("image", {}).get(field))
+
+
+GLM_NL_WITHPOS_HEADER = (
+    "You are an assistant designed to generate anime images based on textual prompts and also to ensure that the characters in the image are positioned according to the normalized bounding box coordinates x1, x2, y1, y2 with values ranging from 1 to 1000. <Prompt Start>"
+)
+GLM_NL_WITHOUTPOS_HEADER = (
+    "You are an assistant designed to generate anime images based on textual prompts. <Prompt Start>"
+)
+GLM_XML_HEADER = (
+    "You are an assistant designed to generate anime images based on structured XML descriptions. <Prompt Start>"
+)
+INTERNLM_NL_WITHPOS_HEADER = GLM_NL_WITHPOS_HEADER
+INTERNLM_NL_WITHOUTPOS_HEADER = GLM_NL_WITHOUTPOS_HEADER
+INTERNLM_XML_HEADER = GLM_XML_HEADER
+DANBOORU_HEADER = (
+    "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags. <Prompt Start>"
+)
+
+PROMPT_KEYS = [
+    "GLM_NL_WITHPOS",
+    "GLM_NL_WITHOUTPOS",
+    "GLM_XML",
+    "InternLM_NL_WITHPOS",
+    "InternLM_NL_WITHOUTPOS",
+    "InternLM_XML",
+    "Danbooru_tags",
+]
 
 
 # ----------------------------
@@ -336,15 +500,17 @@ def analyze_image_for_danbooru(
     )
 
 
-def build_danbooru_variants(
-    artist_name: str,
+def compose_danbooru_metadata(
     components: DanbooruComponents,
-    deterministic_seed: int,
-) -> Tuple[str, str, str]:
-    # Compose prefix and suffix (excluding artist tag explicitly)
+    final_artist_tag: Optional[str],
+) -> Dict[str, Optional[str]]:
+    def join_nonempty(parts: List[str]) -> str:
+        cleaned = [p.strip() for p in parts if p and p.strip()]
+        return ", ".join(cleaned)
+
     prefix_parts = [
         components.final_features_tag_prefix,
-        # artist tag is intentionally excluded
+        final_artist_tag or "",
         components.final_character_tag,
         components.final_copyright_tag,
         components.year_tag_specific,
@@ -356,47 +522,25 @@ def build_danbooru_variants(
         components.additional_tags,
     ]
 
-    def join_nonempty(parts: List[str]) -> str:
-        return ", ".join([p for p in (x.strip() for x in parts) if p])
-
     prefix = join_nonempty(prefix_parts)
     suffix = join_nonempty(suffix_parts)
+    finaltag_dan = join_nonempty([prefix, suffix])
 
-    # Variant 1: canonical order prefix, suffix
-    finaltag_dan_no_artist = join_nonempty([prefix, suffix])
-    v1 = (
-        "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags. <Prompt Start> "
-        + "\\n"
-        + f"Drawn by @{{{artist_name}}},  {finaltag_dan_no_artist}"
-    )
+    if prefix and suffix:
+        prompt_body = f"{prefix},|||{suffix}"
+    elif prefix:
+        prompt_body = prefix
+    elif suffix:
+        prompt_body = suffix
+    else:
+        prompt_body = ""
 
-    # Variant 2: swap order and shuffle features tag order deterministically
-    shuffled_features = components.final_features_tag
-    if components.final_features_tag:
-        items = [t.strip() for t in components.final_features_tag.split(",") if t.strip()]
-        import random
-
-        rnd = random.Random(deterministic_seed)
-        rnd.shuffle(items)
-        shuffled_features = ", ".join(items)
-
-    suffix2_parts = [
-        shuffled_features,
-        components.year_tag,
-        components.final_rating_tag,
-        components.additional_tags,
-    ]
-    suffix2 = join_nonempty(suffix2_parts)
-    prefix2 = prefix  # unchanged
-    finaltag_dan_no_artist_v2 = join_nonempty([suffix2, prefix2])
-
-    v2 = (
-        "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags. <Prompt Start> "
-        + "\\n"
-        + f"Drawn by @{{{artist_name}}},  {finaltag_dan_no_artist_v2}"
-    )
-
-    return v1, v2, finaltag_dan_no_artist
+    return {
+        "prefix": prefix or None,
+        "suffix": suffix or None,
+        "finaltag_dan": finaltag_dan or None,
+        "prompt_body": prompt_body or None,
+    }
 
 
 # ----------------------------
@@ -490,6 +634,39 @@ def apply_placeholder_replacements(text: str, placeholder_to_label: Dict[str, st
             repl_in_caption = label  # use #name for real names
         out = out.replace(placeholder, repl_in_caption)
     return out
+
+
+def build_characters_payload(
+    character_entries: List[Tuple[str, List[int]]], placeholder_to_label: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    for canonical, bbox in character_entries:
+        placeholder = f"${canonical}$"
+        label = placeholder_to_label.get(placeholder, f"#{canonical}")
+        payload.append(
+            {
+                "canonical": canonical,
+                "label": label,
+                "bbox": bbox,
+            }
+        )
+    return payload
+
+
+def format_character_pos_info(
+    character_entries: List[Tuple[str, List[int]]], placeholder_to_label: Dict[str, str]
+) -> Optional[str]:
+    if not character_entries:
+        return None
+    parts: List[str] = []
+    for canonical, bbox in character_entries:
+        placeholder = f"${canonical}$"
+        label = placeholder_to_label.get(placeholder, f"#{canonical}")
+        x1, x2, y1, y2 = bbox
+        parts.append(f"{label}:[{x1},{x2},{y1},{y2}]")
+    if not parts:
+        return None
+    return "Characters: " + ", ".join(parts)
 
 
 def build_glm_variants(
@@ -694,85 +871,168 @@ def choose_unique_output_name(dst_artist_dir: Path, base_name: str) -> str:
         counter += 1
 
 
-def compose_output_txt_path(dst_artist_dir: Path, base_name: str) -> Path:
-    # Same basename with .txt
-    return dst_artist_dir / f"{base_name}.txt"
-
-
-def build_all_annotations_for_image(
-    main_root: Path,
+def build_image_payload(
     nl_root: Path,
     artist_dir: Path,
     dst_artist_dir: Path,
     year_name: str,
     img_path: Path,
+    image_index: int,
     results_json: Optional[dict],
     quality_labels_for_artist: Optional[Dict[str, str]],
     features_threshold: float,
-) -> Tuple[List[str], Optional[str], Optional[str]]:
-    """
-    Returns:
-        annotations_lines: List[str] with each element representing one annotation line (internal newlines escaped as \n)
-        output_image_name: basename.webp used (to allow caller to save image)
-        error_message: Optional error string
-    """
-    artist_name_for_output = artist_dir.name.replace("_", " ")
+) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+    artist_display_name = artist_dir.name.replace("_", " ")
+    final_artist_tag = fmt2danbooru(artist_dir.name)
     base_name = img_path.name
     stem = img_path.stem
 
-    # Danbooru-like components
+    filename_for_analysis = (
+        os.path.join("Augmentation", base_name) if "Augmentation" in img_path.parts else base_name
+    )
+
     components = analyze_image_for_danbooru(
         artist_folder=artist_dir,
         year_folder_name=year_name,
-        filename=("Augmentation" + os.sep + img_path.name) if ("Augmentation" in str(img_path)) else img_path.name,
+        filename=filename_for_analysis,
         results_json=results_json,
         quality_labels_for_artist=quality_labels_for_artist,
         features_threshold=features_threshold,
     )
+    danbooru_meta = compose_danbooru_metadata(components, final_artist_tag)
 
-    # Build danbooru variants (1,2) and get finaltag base
-    seed = seed_from_string(str(img_path))
-    v1, v2, finaltag_dan_no_artist = build_danbooru_variants(artist_name_for_output, components, seed)
+    results_entry = results_json.get(base_name) if results_json and base_name in results_json else {}
+    finaltag_native = None
+    if isinstance(results_entry, dict):
+        for candidate_key in ("finaltag_native", "native_caption", "caption_native", "comment_native", "comment"):
+            candidate_value = strip_or_none(results_entry.get(candidate_key))
+            if candidate_value:
+                finaltag_native = candidate_value
+                break
 
-    # Read NL JSONs
     glm_json_path = nl_root / artist_dir.name / "NL_caption_GLM" / f"{stem}.json"
     internlm_json_path = nl_root / artist_dir.name / "NLcaption" / f"{stem}.json"
     glm_json = safe_read_json(glm_json_path)
     internlm_json = safe_read_json(internlm_json_path)
 
-    annotations: List[str] = []
+    character_entries_glm, placeholder_glm = parse_glm_characters(glm_json)
+    character_entries_intern, placeholder_intern = parse_glm_characters(internlm_json)
 
-    # Fallback logic per spec
-    if glm_json and internlm_json:
-        # All available: produce 6
-        v3, v6, characters_line = build_glm_variants(glm_json, artist_name_for_output, finaltag_dan_no_artist)
-        v4 = build_internlm_variant(internlm_json, artist_name_for_output, characters_line, glm_available=True)
-        v5 = build_xml_variant(glm_json, artist_name_for_output, characters_line)
-        for s in (v1, v2, v3, v4, v5, v6):
-            if s:
-                annotations.append(s)
-    elif glm_json and not internlm_json:
-        # InternLM missing: skip 4; produce 1,2,3,5,6
-        v3, v6, characters_line = build_glm_variants(glm_json, artist_name_for_output, finaltag_dan_no_artist)
-        v5 = build_xml_variant(glm_json, artist_name_for_output, characters_line)
-        for s in (v1, v2, v3, v5, v6):
-            if s:
-                annotations.append(s)
-    elif not glm_json and internlm_json:
-        # GLM missing: only produce 4 without characters
-        v4 = build_internlm_variant(internlm_json, artist_name_for_output, characters_line_from_glm=None, glm_available=False)
-        if v4:
-            annotations.append(v4)
+    if character_entries_glm:
+        character_entries = character_entries_glm
+        placeholder_for_positions = placeholder_glm
     else:
-        # Both missing: only danbooru-style prompt
-        annotations.append(v1)
+        character_entries = character_entries_intern
+        placeholder_for_positions = placeholder_intern
 
-    # Convert to single-line strings with JSON newline markers
-    annotations = [replace_json_newlines(s) for s in annotations]
+    character_pos_info = format_character_pos_info(character_entries, placeholder_for_positions)
+    glm_characters_payload = build_characters_payload(character_entries, placeholder_for_positions)
 
-    # Choose output names (avoid collisions) and return
+    glm_nl_raw = extract_model_field(glm_json, "caption")
+    glm_xml_raw = extract_model_field(glm_json, "tags")
+    internlm_nl_raw = extract_model_field(internlm_json, "caption")
+    internlm_xml_raw = extract_model_field(internlm_json, "tags")
+
+    glm_placeholder_map = placeholder_glm
+    intern_placeholder_map = placeholder_intern or placeholder_glm
+
+    glm_nl_prompt = (
+        collapse_whitespace(apply_placeholder_replacements(glm_nl_raw, glm_placeholder_map))
+        if glm_nl_raw
+        else None
+    )
+    glm_xml_prompt = (
+        collapse_whitespace(apply_placeholder_replacements(glm_xml_raw, glm_placeholder_map))
+        if glm_xml_raw
+        else None
+    )
+    internlm_nl_prompt = (
+        collapse_whitespace(apply_placeholder_replacements(internlm_nl_raw, intern_placeholder_map))
+        if internlm_nl_raw
+        else None
+    )
+    internlm_xml_prompt = (
+        collapse_whitespace(apply_placeholder_replacements(internlm_xml_raw, intern_placeholder_map))
+        if internlm_xml_raw
+        else None
+    )
+
+    drawn_by_segment = f"Drawn by @{final_artist_tag}" if final_artist_tag else None
+    artist_xml_segment = f"<artist_name>{final_artist_tag or ''}</artist_name>"
+
+    prompts: Dict[str, Optional[str]] = {}
+    prompts["GLM_NL_WITHPOS"] = (
+        sanitize_prompt_line(GLM_NL_WITHPOS_HEADER, drawn_by_segment, character_pos_info, glm_nl_prompt)
+        if character_pos_info and glm_nl_prompt
+        else None
+    )
+    prompts["GLM_NL_WITHOUTPOS"] = (
+        sanitize_prompt_line(GLM_NL_WITHOUTPOS_HEADER, drawn_by_segment, glm_nl_prompt)
+        if glm_nl_prompt
+        else None
+    )
+    prompts["GLM_XML"] = (
+        sanitize_prompt_line(GLM_XML_HEADER, artist_xml_segment, glm_xml_prompt) if glm_xml_prompt else None
+    )
+    prompts["InternLM_NL_WITHPOS"] = (
+        sanitize_prompt_line(
+            INTERNLM_NL_WITHPOS_HEADER, drawn_by_segment, character_pos_info, internlm_nl_prompt
+        )
+        if character_pos_info and internlm_nl_prompt
+        else None
+    )
+    prompts["InternLM_NL_WITHOUTPOS"] = (
+        sanitize_prompt_line(INTERNLM_NL_WITHOUTPOS_HEADER, drawn_by_segment, internlm_nl_prompt)
+        if internlm_nl_prompt
+        else None
+    )
+    prompts["InternLM_XML"] = (
+        sanitize_prompt_line(INTERNLM_XML_HEADER, artist_xml_segment, internlm_xml_prompt)
+        if internlm_xml_prompt
+        else None
+    )
+    danbooru_prompt_body = strip_or_none(danbooru_meta.get("prompt_body"))
+    prompts["Danbooru_tags"] = (
+        sanitize_prompt_line(DANBOORU_HEADER, danbooru_prompt_body) if danbooru_prompt_body else None
+    )
+
+    available_prompt_types = [key for key in PROMPT_KEYS if prompts.get(key)]
+
     out_img_name = choose_unique_output_name(dst_artist_dir, stem)
-    return annotations, out_img_name, None
+
+    record: Dict[str, Any] = {
+        "image_name": out_img_name,
+        "source_image_name": base_name,
+        "source_year": year_name,
+        "image_index": image_index,
+        "artist_display_name": artist_display_name,
+        "final_artist_tag": strip_or_none(final_artist_tag),
+        "quality_label": strip_or_none((quality_labels_for_artist or {}).get(base_name)),
+        "glm_nl": glm_nl_raw,
+        "internlm_nl": internlm_nl_raw,
+        "glm_xml": glm_xml_raw,
+        "internlm_xml": internlm_xml_raw,
+        "glm_characters": glm_characters_payload,
+        "character_pos_info": character_pos_info,
+        "finaltag_dan": strip_or_none(danbooru_meta.get("finaltag_dan")),
+        "finaltag_native": finaltag_native,
+        "final_features_tag_prefix": strip_or_none(components.final_features_tag_prefix),
+        "final_features_tag": strip_or_none(components.final_features_tag),
+        "danbooru_prefix": strip_or_none(danbooru_meta.get("prefix")),
+        "danbooru_suffix": strip_or_none(danbooru_meta.get("suffix")),
+        "final_character_tag": strip_or_none(components.final_character_tag),
+        "final_copyright_tag": strip_or_none(components.final_copyright_tag),
+        "year_tag_specific": strip_or_none(components.year_tag_specific),
+        "year_tag": strip_or_none(components.year_tag),
+        "final_rating_tag": strip_or_none(components.final_rating_tag),
+        "additional_tags": strip_or_none(components.additional_tags),
+        "aes_rating": strip_or_none(components.aes_rating),
+        "danbooru_prompt_body": danbooru_prompt_body,
+        "prompts": prompts,
+        "available_prompts": available_prompt_types,
+    }
+
+    return record, out_img_name, None
 
 
 def process_artist(
@@ -795,46 +1055,66 @@ def process_artist(
     if not images:
         return 0, 0
 
-    total = len(images)
-    success = 0
+    ordered_images = order_artist_images(images, results_json)
+    indexed_images = [(idx, year, path) for idx, (year, path) in enumerate(ordered_images, start=1)]
 
-    def handle_one(year_name: str, file_path: Path) -> Tuple[bool, str]:
+    total = len(ordered_images)
+    success = 0
+    image_records: List[Dict[str, Any]] = []
+
+    def handle_one(index_value: int, year_name: str, file_path: Path) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         try:
-            annotations, out_img_name, err = build_all_annotations_for_image(
-                main_root=main_root,
+            record, out_img_name, err = build_image_payload(
                 nl_root=nl_root,
                 artist_dir=artist_dir,
                 dst_artist_dir=dst_artist_dir,
                 year_name=year_name,
                 img_path=file_path,
+                image_index=index_value,
                 results_json=results_json,
                 quality_labels_for_artist=quality_labels.get(artist_dir.name, {}),
                 features_threshold=features_threshold,
             )
             if err:
-                return False, f"{file_path.name}: {err}"
+                return False, None, f"{file_path.name}: {err}"
 
             # Save webp
             out_img_path = dst_artist_dir / out_img_name
             ok = save_as_webp(file_path, out_img_path, min_side)
             if not ok:
-                return False, f"{file_path.name}: failed to save webp"
+                return False, None, f"{file_path.name}: failed to save webp"
 
-            # Save txt with one annotation per line
-            out_txt_path = compose_output_txt_path(dst_artist_dir, Path(out_img_name).stem)
-            out_txt_path.write_text("\n".join(annotations) + "\n", encoding="utf-8")
-            return True, out_img_name
+            return True, record, out_img_name
         except Exception as e:
-            return False, f"{file_path.name}: {e}"
+            return False, None, f"{file_path.name}: {e}"
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(handle_one, year, path) for (year, path) in images]
+        futures = [executor.submit(handle_one, idx, year, path) for idx, year, path in indexed_images]
         for fut in as_completed(futures):
-            ok, _msg = fut.result()
+            ok, record, _msg = fut.result()
             if pbar is not None:
                 pbar.update(1)
             if ok:
                 success += 1
+                if record:
+                    image_records.append(record)
+
+    image_records.sort(key=lambda rec: rec.get("image_index", 0))
+
+    schema_version = 1
+    artist_display_name = artist_dir.name.replace("_", " ")
+    results_payload = {
+        "schema_version": schema_version,
+        "artist": artist_dir.name,
+        "artist_display_name": artist_display_name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "image_count": len(image_records),
+        "prompt_types": PROMPT_KEYS,
+        "images": {record["image_name"]: record for record in image_records},
+    }
+
+    output_json_path = dst_artist_dir / "results.json"
+    output_json_path.write_text(json.dumps(results_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return success, total
 

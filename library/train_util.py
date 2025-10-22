@@ -209,6 +209,7 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.resize_interpolation: Optional[str] = None
+        self.prompt_metadata: Optional[Dict[str, Any]] = None
 
 
 class BucketManager:
@@ -1639,6 +1640,123 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return image
 
+    @staticmethod
+    def _strip_or_none(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    def _sanitize_prompt_probabilities(self, probabilities: Optional[Dict[str, float]]) -> Dict[str, float]:
+        sanitized: Dict[str, float] = {}
+        if isinstance(probabilities, dict):
+            for key, value in probabilities.items():
+                key_str = self._strip_or_none(key)
+                if not key_str:
+                    continue
+                try:
+                    float_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if float_value < 0:
+                    continue
+                sanitized[key_str] = float_value
+        return sanitized
+
+    def _compute_prompt_distribution(self, available_types: Sequence[str]) -> List[Tuple[str, float]]:
+        weights: List[Tuple[str, float]] = []
+        total = 0.0
+        for prompt_type in available_types:
+            weight = float(self.prompt_type_probabilities.get(prompt_type, 0.0))
+            if weight < 0:
+                weight = 0.0
+            weights.append((prompt_type, weight))
+            total += weight
+        if total <= 0 and available_types:
+            uniform = 1.0 / len(available_types)
+            return [(prompt_type, uniform) for prompt_type in available_types]
+        if total == 0:
+            return []
+        return [(prompt_type, weight / total) for prompt_type, weight in weights]
+
+    def _prepare_image_prompt_metadata(self, record: Optional[dict], image_name: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(record, dict):
+            return None
+        prompts = record.get("prompts")
+        if not isinstance(prompts, dict):
+            return None
+
+        normalize_fn = getattr(self, "_normalize_prompt_text_fn", None)
+        prompt_bodies: Dict[str, str] = {}
+        system_prompts: Dict[str, Optional[str]] = {}
+        available_types: List[str] = []
+
+        for prompt_type, prompt_text in prompts.items():
+            if not isinstance(prompt_text, str):
+                continue
+            stripped = prompt_text.strip()
+            if not stripped:
+                continue
+            available_types.append(prompt_type)
+            if callable(normalize_fn):
+                body, system_prompt = normalize_fn(stripped)
+                prompt_bodies[prompt_type] = body if body is not None else stripped
+                system_prompts[prompt_type] = system_prompt
+            else:
+                prompt_bodies[prompt_type] = stripped
+                system_prompts[prompt_type] = None
+
+        if not available_types:
+            logger.warning(f"No available prompts for image '{image_name}' in results.json.")
+            return None
+
+        distribution = self._compute_prompt_distribution(available_types)
+        default_prompt_type = (
+            max(distribution, key=lambda item: item[1])[0] if distribution else available_types[0]
+        )
+        default_caption = prompt_bodies.get(default_prompt_type, "")
+
+        metadata: Dict[str, Any] = {
+            "record": record,
+            "available_types": available_types,
+            "distribution": distribution,
+            "prompts": prompts,
+            "prompt_bodies": prompt_bodies,
+            "system_prompts": system_prompts,
+            "default_prompt_type": default_prompt_type,
+            "default_caption": default_caption,
+            "default_system_prompt": system_prompts.get(default_prompt_type),
+            "image_index": record.get("image_index"),
+        }
+        return metadata
+
+    def _select_prompt_for_image(self, image_info: ImageInfo) -> Tuple[str, str]:
+        metadata = getattr(image_info, "prompt_metadata", None)
+        if not metadata:
+            return image_info.caption, "default"
+
+        available_types: List[str] = metadata.get("available_types") or []
+        if not available_types:
+            return metadata.get("default_caption") or image_info.caption, metadata.get("default_prompt_type") or "default"
+
+        distribution: List[Tuple[str, float]] = metadata.get("distribution") or []
+        weights = [weight for _ptype, weight in distribution] if distribution else None
+
+        if weights and any(weight > 0 for weight in weights):
+            try:
+                selected_type = random.choices(available_types, weights=weights, k=1)[0]
+            except Exception:
+                selected_type = random.choice(available_types)
+        else:
+            selected_type = random.choice(available_types)
+
+        prompt_bodies: Dict[str, str] = metadata.get("prompt_bodies") or {}
+        caption = prompt_bodies.get(selected_type) or metadata.get("default_caption") or image_info.caption
+
+        metadata["last_prompt_type"] = selected_type
+        metadata["last_caption"] = caption
+        return caption, selected_type
+
     def __len__(self):
         return self._length
 
@@ -1781,7 +1899,10 @@ class BaseDataset(torch.utils.data.Dataset):
             flippeds.append(flipped)
 
             # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
+            if image_info.prompt_metadata:
+                caption, _ = self._select_prompt_for_image(image_info)
+            else:
+                caption = image_info.caption
 
             tokenization_required = (
                 self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
@@ -1802,7 +1923,7 @@ class BaseDataset(torch.utils.data.Dataset):
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
-                caption = self.process_caption(subset, image_info.caption)
+                caption = self.process_caption(subset, caption)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
                 # if self.XTI_layers:
                 #     caption_layer = []
@@ -1912,8 +2033,10 @@ class BaseDataset(torch.utils.data.Dataset):
                 assert random_crop == subset.random_crop, "random_crop must be same in a batch"
                 assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
 
-            caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
-
+            if image_info.prompt_metadata:
+                caption, _ = self._select_prompt_for_image(image_info)
+            else:
+                caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
             if self.caching_mode == "latents":
                 image = load_image(image_info.absolute_path)
             else:
@@ -1974,6 +2097,8 @@ class DreamBoothDataset(BaseDataset):
         validation_split: float,
         validation_seed: Optional[int],
         resize_interpolation: Optional[str],
+        prompt_type_probabilities: Optional[Dict[str, float]] = None,
+        prompt_top_index_boost: int = 0,
     ) -> None:
         super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
@@ -2002,6 +2127,25 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
+        self.lumina_prompt_types = [
+            "GLM_NL_WITHPOS",
+            "GLM_NL_WITHOUTPOS",
+            "GLM_XML",
+            "InternLM_NL_WITHPOS",
+            "InternLM_NL_WITHOUTPOS",
+            "InternLM_XML",
+            "Danbooru_tags",
+        ]
+        self.prompt_type_probabilities = self._sanitize_prompt_probabilities(prompt_type_probabilities)
+        if self.prompt_type_probabilities:
+            total_prob = sum(self.prompt_type_probabilities.values())
+            if not math.isclose(total_prob, 1.0, rel_tol=1e-3, abs_tol=1e-3):
+                logger.warning(f"Prompt type probabilities sum to {total_prob:.4f}, normalizing to 1.0")
+                if total_prob > 0:
+                    self.prompt_type_probabilities = {k: v / total_prob for k, v in self.prompt_type_probabilities.items()}
+        self.prompt_extra_repeat_top_n = max(0, int(prompt_top_index_boost or 0))
+        self.image_prompt_metadata: Dict[str, Dict[str, Any]] = {}
+
         prompt_split_token = "<Prompt Start>"
 
         def normalize_prompt_text(raw_text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -2018,6 +2162,8 @@ class DreamBoothDataset(BaseDataset):
                 normalized = after.lstrip(" 	")
             normalized = normalized.strip()
             return normalized, system_prompt
+
+        self._normalize_prompt_text_fn = normalize_prompt_text
 
         def parse_repeat_strategy_file(file_path: str) -> Dict[str, int]:
             strategy: Dict[str, int] = {}
@@ -2146,6 +2292,7 @@ class DreamBoothDataset(BaseDataset):
                     use_cached_info_for_subset = False
 
             system_prompts: Set[str] = set()
+            prompt_metadata_map: Dict[str, Dict[str, Any]] = {}
 
             if use_cached_info_for_subset:
                 with open(info_cache_file, "r", encoding="utf-8") as f:
@@ -2216,22 +2363,66 @@ class DreamBoothDataset(BaseDataset):
 
                 captions = []
                 missing_captions = []
-                for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img, sys_prompt = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
-                    if sys_prompt:
-                        system_prompts.add(sys_prompt)
-                    if cap_for_img is None and subset.class_tokens is None:
-                        logger.warning(
-                            f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
-                        )
-                        captions.append("")
-                        missing_captions.append(img_path)
-                    else:
-                        if cap_for_img is None:
-                            captions.append(subset.class_tokens)
+                use_json_prompts = False
+
+                results_json_path = os.path.join(subset.image_dir, "results.json")
+                artist_prompt_records: Dict[str, dict] = {}
+                if os.path.isfile(results_json_path):
+                    try:
+                        with open(results_json_path, "r", encoding="utf-8") as f:
+                            payload = json.load(f)
+                        images_section = payload.get("images")
+                        if isinstance(images_section, dict):
+                            artist_prompt_records = images_section
+                        elif isinstance(images_section, list):
+                            for entry in images_section:
+                                if isinstance(entry, dict):
+                                    name = entry.get("image_name")
+                                    if name:
+                                        artist_prompt_records[str(name)] = entry
+                        if artist_prompt_records:
+                            use_json_prompts = True
+                        else:
+                            logger.warning(f"'images' section missing or empty in {results_json_path}. Falling back to caption files.")
+                    except Exception as e:
+                        logger.warning(f"Failed to read prompt metadata from {results_json_path}: {e}")
+
+                if use_json_prompts:
+                    valid_img_paths: List[str] = []
+                    valid_sizes: List[Optional[Tuple[int, int]]] = []
+                    for idx, img_path in enumerate(tqdm(img_paths, desc="load prompts")):
+                        image_name = os.path.basename(img_path)
+                        record = artist_prompt_records.get(image_name)
+                        metadata = self._prepare_image_prompt_metadata(record, image_name)
+                        if metadata is None:
+                            missing_captions.append(img_path)
+                            continue
+                        prompt_metadata_map[img_path] = metadata
+                        self.image_prompt_metadata[img_path] = metadata
+                        caption_body = metadata.get("default_caption") or ""
+                        captions.append(caption_body)
+                        valid_img_paths.append(img_path)
+                        valid_sizes.append(sizes[idx] if idx < len(sizes) else None)
+                        system_prompt = metadata.get("default_system_prompt")
+                        if system_prompt:
+                            system_prompts.add(system_prompt)
+                    img_paths = valid_img_paths
+                    sizes = valid_sizes
+                else:
+                    for img_path in tqdm(img_paths, desc="read caption"):
+                        cap_for_img, sys_prompt = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                        if sys_prompt:
+                            system_prompts.add(sys_prompt)
+                        if cap_for_img is None and subset.class_tokens is None:
+                            logger.warning(f"neither caption file nor class tokens are found for {img_path}. using empty caption.")
+                            captions.append("")
                             missing_captions.append(img_path)
                         else:
-                            captions.append(cap_for_img)
+                            if cap_for_img is None:
+                                captions.append(subset.class_tokens)
+                                missing_captions.append(img_path)
+                            else:
+                                captions.append(cap_for_img)
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)
 
@@ -2298,6 +2489,21 @@ class DreamBoothDataset(BaseDataset):
                     if repeat_int < 1:
                         logger.warning(f"Repeat value for image '{img_path}' is less than 1, fallback to 1.")
                         repeat_int = 1
+                    if self.prompt_extra_repeat_top_n > 0:
+                        metadata = prompt_metadata_map.get(img_path)
+                        image_index_value = None
+                        if metadata is not None:
+                            image_index_value = metadata.get("image_index")
+                        try:
+                            image_index_int = int(image_index_value)
+                        except (TypeError, ValueError):
+                            image_index_int = None
+                        if (
+                            image_index_int is not None
+                            and image_index_int >= 1
+                            and image_index_int <= self.prompt_extra_repeat_top_n
+                        ):
+                            repeat_int += 1
                     repeat_counts.append(repeat_int)
                 else:
                     repeat_counts.append(1)
@@ -2342,6 +2548,9 @@ class DreamBoothDataset(BaseDataset):
                 )
                 if size is not None:
                     info.image_size = size
+                metadata = self.image_prompt_metadata.get(img_path)
+                if metadata is not None:
+                    info.prompt_metadata = metadata
                 if subset.is_reg:
                     reg_infos.append((info, subset))
                 else:

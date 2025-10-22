@@ -120,6 +120,8 @@ class DreamBoothDatasetParams(BaseDatasetParams):
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
     prior_loss_weight: float = 1.0
+    prompt_type_probabilities: Optional[Dict[str, float]] = None
+    prompt_top_index_boost: int = 0
     
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
@@ -248,6 +250,8 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "network_multiplier": float,
         "resize_interpolation": str,
+        "prompt_type_probabilities": dict,
+        "prompt_top_index_boost": int,
     }
 
     # options handled by argparse but not handled by user config
