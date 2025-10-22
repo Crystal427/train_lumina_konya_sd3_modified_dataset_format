@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageFile
 from tqdm import tqdm
@@ -203,17 +203,17 @@ def collapse_whitespace(value: Optional[str]) -> Optional[str]:
     return text if text else None
 
 
-def sanitize_prompt_line(*parts: Optional[str]) -> Optional[str]:
-    tokens: List[str] = []
-    for part in parts:
-        if part is None:
-            continue
-        normalized = collapse_whitespace(part)
-        if normalized:
-            tokens.append(normalized)
-    if not tokens:
+def compose_prompt(header: str, segments: List[Optional[str]]) -> Optional[str]:
+    if not header:
         return None
-    return collapse_whitespace(" ".join(tokens))
+    lines: List[str] = [collapse_whitespace(header) or header]
+    for segment in segments:
+        cleaned = collapse_whitespace(segment)
+        if cleaned:
+            lines.append(cleaned)
+    if not lines:
+        return None
+    return "\n".join(lines)
 
 
 def extract_model_field(model_json: Optional[dict], field: str) -> Optional[str]:
@@ -859,15 +859,35 @@ def find_image_files_in_years(artist_dir: Path) -> List[Tuple[str, Path]]:
     return results
 
 
-def choose_unique_output_name(dst_artist_dir: Path, base_name: str) -> str:
-    candidate = f"{base_name}.webp"
-    if not (dst_artist_dir / candidate).exists():
-        return candidate
-    counter = 2
+def choose_unique_output_name(
+    dst_artist_dir: Path,
+    base_name: str,
+    metadata_only: bool = False,
+    original_extension: Optional[str] = None,
+    used_names: Optional[Set[str]] = None,
+) -> str:
+    if metadata_only:
+        extension = original_extension if original_extension else ""
+    else:
+        extension = ".webp"
+
+    def build_candidate(counter: int) -> str:
+        suffix = "" if counter == 1 else f"_{counter}"
+        return f"{base_name}{suffix}{extension}"
+
+    counter = 1
     while True:
-        candidate = f"{base_name}_{counter}.webp"
-        if not (dst_artist_dir / candidate).exists():
-            return candidate
+        candidate = build_candidate(counter)
+        if metadata_only:
+            if used_names is None or candidate not in used_names:
+                if used_names is not None:
+                    used_names.add(candidate)
+                return candidate
+        else:
+            if not (dst_artist_dir / candidate).exists():
+                if used_names is not None:
+                    used_names.add(candidate)
+                return candidate
         counter += 1
 
 
@@ -878,6 +898,7 @@ def build_image_payload(
     year_name: str,
     img_path: Path,
     image_index: int,
+    assigned_img_name: str,
     results_json: Optional[dict],
     quality_labels_for_artist: Optional[Dict[str, str]],
     features_threshold: float,
@@ -962,46 +983,44 @@ def build_image_payload(
 
     prompts: Dict[str, Optional[str]] = {}
     prompts["GLM_NL_WITHPOS"] = (
-        sanitize_prompt_line(GLM_NL_WITHPOS_HEADER, drawn_by_segment, character_pos_info, glm_nl_prompt)
+        compose_prompt(
+            GLM_NL_WITHPOS_HEADER,
+            [drawn_by_segment, character_pos_info, glm_nl_prompt],
+        )
         if character_pos_info and glm_nl_prompt
         else None
     )
     prompts["GLM_NL_WITHOUTPOS"] = (
-        sanitize_prompt_line(GLM_NL_WITHOUTPOS_HEADER, drawn_by_segment, glm_nl_prompt)
-        if glm_nl_prompt
-        else None
+        compose_prompt(GLM_NL_WITHOUTPOS_HEADER, [drawn_by_segment, glm_nl_prompt]) if glm_nl_prompt else None
     )
     prompts["GLM_XML"] = (
-        sanitize_prompt_line(GLM_XML_HEADER, artist_xml_segment, glm_xml_prompt) if glm_xml_prompt else None
+        compose_prompt(GLM_XML_HEADER, [artist_xml_segment, glm_xml_prompt]) if glm_xml_prompt else None
     )
     prompts["InternLM_NL_WITHPOS"] = (
-        sanitize_prompt_line(
-            INTERNLM_NL_WITHPOS_HEADER, drawn_by_segment, character_pos_info, internlm_nl_prompt
+        compose_prompt(
+            INTERNLM_NL_WITHPOS_HEADER,
+            [drawn_by_segment, character_pos_info, internlm_nl_prompt],
         )
         if character_pos_info and internlm_nl_prompt
         else None
     )
     prompts["InternLM_NL_WITHOUTPOS"] = (
-        sanitize_prompt_line(INTERNLM_NL_WITHOUTPOS_HEADER, drawn_by_segment, internlm_nl_prompt)
+        compose_prompt(INTERNLM_NL_WITHOUTPOS_HEADER, [drawn_by_segment, internlm_nl_prompt])
         if internlm_nl_prompt
         else None
     )
     prompts["InternLM_XML"] = (
-        sanitize_prompt_line(INTERNLM_XML_HEADER, artist_xml_segment, internlm_xml_prompt)
-        if internlm_xml_prompt
-        else None
+        compose_prompt(INTERNLM_XML_HEADER, [artist_xml_segment, internlm_xml_prompt]) if internlm_xml_prompt else None
     )
     danbooru_prompt_body = strip_or_none(danbooru_meta.get("prompt_body"))
     prompts["Danbooru_tags"] = (
-        sanitize_prompt_line(DANBOORU_HEADER, danbooru_prompt_body) if danbooru_prompt_body else None
+        compose_prompt(DANBOORU_HEADER, [danbooru_prompt_body]) if danbooru_prompt_body else None
     )
 
     available_prompt_types = [key for key in PROMPT_KEYS if prompts.get(key)]
 
-    out_img_name = choose_unique_output_name(dst_artist_dir, stem)
-
     record: Dict[str, Any] = {
-        "image_name": out_img_name,
+        "image_name": assigned_img_name,
         "source_image_name": base_name,
         "source_year": year_name,
         "image_index": image_index,
@@ -1032,7 +1051,7 @@ def build_image_payload(
         "available_prompts": available_prompt_types,
     }
 
-    return record, out_img_name, None
+    return record, assigned_img_name, None
 
 
 def process_artist(
@@ -1044,6 +1063,7 @@ def process_artist(
     features_threshold: float,
     min_side: int,
     max_workers: int,
+    metadata_only: bool,
     pbar: Optional[Any] = None,
 ) -> Tuple[int, int]:
     results_path = artist_dir / "results.json"
@@ -1062,8 +1082,18 @@ def process_artist(
     success = 0
     image_records: List[Dict[str, Any]] = []
 
+    used_names: Set[str] = set()
+
     def handle_one(index_value: int, year_name: str, file_path: Path) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         try:
+            stem = file_path.stem
+            assigned_name = choose_unique_output_name(
+                dst_artist_dir=dst_artist_dir,
+                base_name=stem,
+                metadata_only=metadata_only,
+                original_extension=file_path.suffix,
+                used_names=used_names,
+            )
             record, out_img_name, err = build_image_payload(
                 nl_root=nl_root,
                 artist_dir=artist_dir,
@@ -1071,6 +1101,7 @@ def process_artist(
                 year_name=year_name,
                 img_path=file_path,
                 image_index=index_value,
+                assigned_img_name=assigned_name,
                 results_json=results_json,
                 quality_labels_for_artist=quality_labels.get(artist_dir.name, {}),
                 features_threshold=features_threshold,
@@ -1078,11 +1109,11 @@ def process_artist(
             if err:
                 return False, None, f"{file_path.name}: {err}"
 
-            # Save webp
-            out_img_path = dst_artist_dir / out_img_name
-            ok = save_as_webp(file_path, out_img_path, min_side)
-            if not ok:
-                return False, None, f"{file_path.name}: failed to save webp"
+            if not metadata_only:
+                out_img_path = dst_artist_dir / out_img_name
+                ok = save_as_webp(file_path, out_img_path, min_side)
+                if not ok:
+                    return False, None, f"{file_path.name}: failed to save webp"
 
             return True, record, out_img_name
         except Exception as e:
@@ -1132,6 +1163,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-side", type=int, default=1600, help="Resize so that the minimum side equals this value")
     parser.add_argument("--features-threshold", type=float, default=FEATURES_THRESHOLD_DEFAULT, help="Threshold for features from results.json")
     parser.add_argument("--max-workers", type=int, default=os.cpu_count() or 8, help="Thread pool size")
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Only emit per-artist metadata JSON without writing converted images",
+    )
 
     args = parser.parse_args(argv)
     main_root = Path(args.main_root)
@@ -1157,6 +1193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 features_threshold=args.features_threshold,
                 min_side=args.min_side,
                 max_workers=args.max_workers,
+                metadata_only=args.metadata_only,
                 pbar=pbar,
             )
             total_success += ok_count

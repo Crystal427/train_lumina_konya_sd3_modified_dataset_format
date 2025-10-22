@@ -1679,6 +1679,25 @@ class BaseDataset(torch.utils.data.Dataset):
             return []
         return [(prompt_type, weight / total) for prompt_type, weight in weights]
 
+    @staticmethod
+    def _parse_danbooru_tokens(prompt_text: str) -> Tuple[List[str], List[str]]:
+        prefix_tokens: List[str] = []
+        suffix_tokens: List[str] = []
+        if not isinstance(prompt_text, str):
+            return prefix_tokens, suffix_tokens
+
+        if "|||" in prompt_text:
+            left, right = prompt_text.split("|||", 1)
+        else:
+            left, right = prompt_text, ""
+
+        def split_segment(segment: str) -> List[str]:
+            return [token.strip() for token in segment.split(",") if token.strip()]
+
+        prefix_tokens = split_segment(left)
+        suffix_tokens = split_segment(right)
+        return prefix_tokens, suffix_tokens
+
     def _prepare_image_prompt_metadata(self, record: Optional[dict], image_name: str) -> Optional[Dict[str, Any]]:
         if not isinstance(record, dict):
             return None
@@ -1716,6 +1735,11 @@ class BaseDataset(torch.utils.data.Dataset):
         )
         default_caption = prompt_bodies.get(default_prompt_type, "")
 
+        danbooru_tokens = None
+        danbooru_body = prompt_bodies.get("Danbooru_tags")
+        if danbooru_body:
+            danbooru_tokens = self._parse_danbooru_tokens(danbooru_body)
+
         metadata: Dict[str, Any] = {
             "record": record,
             "available_types": available_types,
@@ -1728,6 +1752,8 @@ class BaseDataset(torch.utils.data.Dataset):
             "default_system_prompt": system_prompts.get(default_prompt_type),
             "image_index": record.get("image_index"),
         }
+        if danbooru_tokens:
+            metadata["danbooru_tokens"] = danbooru_tokens
         return metadata
 
     def _select_prompt_for_image(self, image_info: ImageInfo) -> Tuple[str, str]:
@@ -1752,6 +1778,25 @@ class BaseDataset(torch.utils.data.Dataset):
 
         prompt_bodies: Dict[str, str] = metadata.get("prompt_bodies") or {}
         caption = prompt_bodies.get(selected_type) or metadata.get("default_caption") or image_info.caption
+
+        if selected_type == "Danbooru_tags":
+            danbooru_tokens = metadata.get("danbooru_tokens")
+            if danbooru_tokens:
+                prefix_tokens, suffix_tokens = danbooru_tokens
+                prefix_list = list(prefix_tokens)
+                suffix_list = list(suffix_tokens)
+                if prefix_list:
+                    random.shuffle(prefix_list)
+                if suffix_list:
+                    random.shuffle(suffix_list)
+                prefix_text = ", ".join(prefix_list) if prefix_list else ""
+                suffix_text = ", ".join(suffix_list) if suffix_list else ""
+                if prefix_text and suffix_text:
+                    caption = f"{prefix_text},|||{suffix_text}"
+                elif prefix_text:
+                    caption = prefix_text
+                elif suffix_text:
+                    caption = f"|||{suffix_text}"
 
         metadata["last_prompt_type"] = selected_type
         metadata["last_caption"] = caption
