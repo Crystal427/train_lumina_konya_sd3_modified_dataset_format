@@ -2408,49 +2408,78 @@ class DreamBoothDataset(BaseDataset):
 
                 captions = []
                 missing_captions = []
-                use_json_prompts = False
 
-                results_json_path = os.path.join(subset.image_dir, "results.json")
-                artist_prompt_records: Dict[str, dict] = {}
-                if os.path.isfile(results_json_path):
-                    try:
-                        with open(results_json_path, "r", encoding="utf-8") as f:
-                            payload = json.load(f)
-                        images_section = payload.get("images")
-                        if isinstance(images_section, dict):
-                            artist_prompt_records = images_section
-                        elif isinstance(images_section, list):
-                            for entry in images_section:
-                                if isinstance(entry, dict):
-                                    name = entry.get("image_name")
-                                    if name:
-                                        artist_prompt_records[str(name)] = entry
-                        if artist_prompt_records:
-                            use_json_prompts = True
-                        else:
-                            logger.warning(f"'images' section missing or empty in {results_json_path}. Falling back to caption files.")
-                    except Exception as e:
-                        logger.warning(f"Failed to read prompt metadata from {results_json_path}: {e}")
+                metadata_cache: Dict[pathlib.Path, Optional[dict]] = {}
+                subset_root_path = base_dir_path.resolve()
 
-                if use_json_prompts:
-                    valid_img_paths: List[str] = []
-                    valid_sizes: List[Optional[Tuple[int, int]]] = []
-                    for idx, img_path in enumerate(tqdm(img_paths, desc="load prompts")):
-                        image_name = os.path.basename(img_path)
-                        record = artist_prompt_records.get(image_name)
-                        metadata = self._prepare_image_prompt_metadata(record, image_name)
-                        if metadata is None:
-                            missing_captions.append(img_path)
-                            continue
-                        prompt_metadata_map[img_path] = metadata
-                        self.image_prompt_metadata[img_path] = metadata
-                        caption_body = metadata.get("default_caption") or ""
-                        captions.append(caption_body)
-                        valid_img_paths.append(img_path)
-                        valid_sizes.append(sizes[idx] if idx < len(sizes) else None)
-                        system_prompt = metadata.get("default_system_prompt")
-                        if system_prompt:
-                            system_prompts.add(system_prompt)
+                def load_metadata_for_directory(directory: pathlib.Path) -> Optional[dict]:
+                    directory = directory.resolve()
+                    if directory in metadata_cache:
+                        return metadata_cache[directory]
+                    results_file = directory / "results.json"
+                    metadata = None
+                    if results_file.is_file():
+                        try:
+                            with open(results_file, "r", encoding="utf-8") as f:
+                                metadata = json.load(f)
+                        except Exception as exc:
+                            logger.warning(f"Failed to read prompt metadata from {results_file}: {exc}")
+                            metadata = None
+                    metadata_cache[directory] = metadata
+                    return metadata
+
+                def fetch_prompt_record(image_path_str: str) -> Optional[dict]:
+                    image_path = pathlib.Path(image_path_str)
+                    image_name = image_path.name
+                    current_dir = image_path.parent
+                    while True:
+                        metadata = load_metadata_for_directory(current_dir)
+                        if metadata:
+                            images_section = metadata.get("images")
+                            if isinstance(images_section, dict):
+                                record = images_section.get(image_name)
+                                if record is None:
+                                    for entry in images_section.values():
+                                        if (
+                                            isinstance(entry, dict)
+                                            and entry.get("source_image_name") == image_name
+                                        ):
+                                            record = entry
+                                            break
+                                if record:
+                                    return record
+                        if current_dir == subset_root_path:
+                            break
+                        try:
+                            if subset_root_path not in current_dir.parents:
+                                break
+                        except Exception:
+                            break
+                        current_dir = current_dir.parent
+                    return None
+
+                prompt_based_captions = []
+                valid_img_paths: List[str] = []
+                valid_sizes: List[Optional[Tuple[int, int]]] = []
+
+                for idx, img_path in enumerate(tqdm(img_paths, desc="load prompts")):
+                    record = fetch_prompt_record(img_path)
+                    metadata = self._prepare_image_prompt_metadata(record, os.path.basename(img_path))
+                    if metadata is None:
+                        missing_captions.append(img_path)
+                        continue
+                    prompt_metadata_map[img_path] = metadata
+                    self.image_prompt_metadata[img_path] = metadata
+                    caption_body = metadata.get("default_caption") or ""
+                    prompt_based_captions.append(caption_body)
+                    valid_img_paths.append(img_path)
+                    valid_sizes.append(sizes[idx] if idx < len(sizes) else None)
+                    system_prompt = metadata.get("default_system_prompt")
+                    if system_prompt:
+                        system_prompts.add(system_prompt)
+
+                if prompt_based_captions:
+                    captions = prompt_based_captions
                     img_paths = valid_img_paths
                     sizes = valid_sizes
                 else:
