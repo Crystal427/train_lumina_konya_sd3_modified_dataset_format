@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -1064,6 +1065,7 @@ def process_artist(
     min_side: int,
     max_workers: int,
     metadata_only: bool,
+    cache_dir: Optional[Path] = None,
     pbar: Optional[Any] = None,
 ) -> Tuple[int, int]:
     results_path = artist_dir / "results.json"
@@ -1111,9 +1113,24 @@ def process_artist(
 
             if not metadata_only:
                 out_img_path = dst_artist_dir / out_img_name
-                ok = save_as_webp(file_path, out_img_path, min_side)
-                if not ok:
-                    return False, None, f"{file_path.name}: failed to save webp"
+                
+                # Check if cached file exists
+                cached_file_copied = False
+                if cache_dir is not None:
+                    cache_artist_dir = cache_dir / artist_dir.name
+                    cached_img_path = cache_artist_dir / out_img_name
+                    if cached_img_path.exists() and cached_img_path.is_file():
+                        try:
+                            shutil.copy2(cached_img_path, out_img_path)
+                            cached_file_copied = True
+                        except Exception:
+                            cached_file_copied = False
+                
+                # If no cached file or copy failed, convert the image
+                if not cached_file_copied:
+                    ok = save_as_webp(file_path, out_img_path, min_side)
+                    if not ok:
+                        return False, None, f"{file_path.name}: failed to save webp"
 
             return True, record, out_img_name
         except Exception as e:
@@ -1160,6 +1177,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Root path of the natural language dataset (artists with NLcaption and NL_caption_GLM)",
     )
     parser.add_argument("--output-root", type=str, required=True, help="Destination root to write webp and txt preserving artist structure")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Optional cache directory with same structure as output; reuse existing files to avoid conversion")
     parser.add_argument("--min-side", type=int, default=1600, help="Resize so that the minimum side equals this value")
     parser.add_argument("--features-threshold", type=float, default=FEATURES_THRESHOLD_DEFAULT, help="Threshold for features from results.json")
     parser.add_argument("--max-workers", type=int, default=os.cpu_count() or 8, help="Thread pool size")
@@ -1173,6 +1191,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     main_root = Path(args.main_root)
     nl_root = Path(args.nl_root)
     output_root = Path(args.output_root)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
     ensure_dir(output_root)
 
     # Aggregate quality labels
@@ -1194,6 +1213,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 min_side=args.min_side,
                 max_workers=args.max_workers,
                 metadata_only=args.metadata_only,
+                cache_dir=cache_dir,
                 pbar=pbar,
             )
             total_success += ok_count
