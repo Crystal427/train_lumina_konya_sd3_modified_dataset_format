@@ -130,7 +130,7 @@ def build_webp_index(dest_root: Path) -> Dict[str, List[Tuple[Path, str]]]:
     return webp_index
 
 
-def find_npz_files(root: Path, pattern: str = "*_lumina.npz") -> List[Tuple[Path, Path, str, Optional[Path]]]:
+def find_npz_files(root: Path, pattern: str = "*_lumina.npz") -> List[Tuple[Path, Path, str, str, Optional[Path]]]:
     """
     Find all npz files matching the pattern in root directory.
     
@@ -139,9 +139,9 @@ def find_npz_files(root: Path, pattern: str = "*_lumina.npz") -> List[Tuple[Path
         pattern: Glob pattern for npz files
         
     Returns:
-        List of (artist_dir, npz_file_path, base_name, txt_file_path) tuples
+        List of (artist_dir, npz_file_path, matching_key, npz_suffix, txt_file_path) tuples
     """
-    results: List[Tuple[Path, Path, str, Optional[Path]]] = []
+    results: List[Tuple[Path, Path, str, str, Optional[Path]]] = []
     
     if not root.exists():
         print(f"Warning: Source directory does not exist: {root}")
@@ -159,12 +159,17 @@ def find_npz_files(root: Path, pattern: str = "*_lumina.npz") -> List[Tuple[Path
         # Find all npz files in this artist directory
         for npz_file in artist_dir.glob(pattern):
             if npz_file.is_file():
-                base_name = extract_base_name_from_npz(npz_file.name)
-                if base_name:
+                npz_suffix = extract_npz_suffix(npz_file.name)
+                if npz_suffix:
+                    # Remove suffix to get the base part
+                    base_part = npz_file.name[:-len(npz_suffix)]
+                    matching_key = extract_matching_key(base_part)
+                    
                     # Check if corresponding txt file exists
-                    txt_file = artist_dir / f"{base_name}.txt"
+                    # txt file should match the base part (before suffix)
+                    txt_file = artist_dir / f"{base_part}.txt"
                     txt_file_path = txt_file if txt_file.exists() else None
-                    results.append((artist_dir, npz_file, base_name, txt_file_path))
+                    results.append((artist_dir, npz_file, matching_key, npz_suffix, txt_file_path))
     
     return results
 
@@ -175,10 +180,15 @@ def copy_npz_with_structure(
     pattern: str = "*_lumina.npz",
     dry_run: bool = False,
     verbose: bool = False,
-) -> Tuple[int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int]:
     """
-    Copy npz files from source to destination, only if matching webp exists.
+    Copy npz files from source to destination with renamed filenames to match target webp.
     Also copy corresponding txt files if they exist.
+    
+    The function:
+    1. Matches npz and webp files by their matching key (first 50 chars or before last underscore)
+    2. Renames npz files to include the random suffix from target webp
+    3. Skips files with multiple matches (ambiguous)
     
     Args:
         source_root: Source directory containing npz files
@@ -188,21 +198,26 @@ def copy_npz_with_structure(
         verbose: If True, show detailed matching information
         
     Returns:
-        Tuple of (npz_copied, npz_skipped, total_npz, txt_copied, txt_skipped)
+        Tuple of (npz_copied, npz_skipped_no_match, npz_skipped_multi_match, total_npz, txt_copied, txt_skipped)
     """
     print("Building index of webp files in destination directory...")
     webp_index = build_webp_index(dest_root)
-    print(f"Found {len(webp_index)} webp files in destination")
+    
+    # Count unique keys and total webp files
+    unique_keys = len(webp_index)
+    total_webp_files = sum(len(matches) for matches in webp_index.values())
+    print(f"Found {total_webp_files} webp files with {unique_keys} unique matching keys in destination")
     
     print("\nScanning for npz files in source directory...")
     npz_files = find_npz_files(source_root, pattern)
     
     if not npz_files:
         print(f"No npz files matching pattern '{pattern}' found in {source_root}")
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
     
     npz_copied = 0
-    npz_skipped = 0
+    npz_skipped_no_match = 0
+    npz_skipped_multi_match = 0
     txt_copied = 0
     txt_skipped = 0
     total_count = len(npz_files)
@@ -213,24 +228,45 @@ def copy_npz_with_structure(
     else:
         print()
     
-    for artist_dir, npz_file, base_name, txt_file in tqdm(npz_files, desc="Processing files", unit="file"):
+    for artist_dir, npz_file, matching_key, npz_suffix, txt_file in tqdm(npz_files, desc="Processing files", unit="file"):
         artist_name = artist_dir.name
         
         # Build the key to look up in webp_index
-        key = f"{artist_name}/{base_name}"
+        key = f"{artist_name}/{matching_key}"
         
         # Check if corresponding webp exists in destination
         if key not in webp_index:
             if verbose:
-                tqdm.write(f"Skip (no match): {npz_file.name} (looking for {base_name}.webp)")
-            npz_skipped += 1
+                tqdm.write(f"Skip (no match): {npz_file.name} (key: {matching_key})")
+            npz_skipped_no_match += 1
             if txt_file:
                 txt_skipped += 1
             continue
         
+        # Get matching webp files
+        matching_webps = webp_index[key]
+        
+        # Skip if multiple matches (ambiguous)
+        if len(matching_webps) > 1:
+            if verbose:
+                tqdm.write(f"Skip (multiple matches): {npz_file.name} has {len(matching_webps)} matching webp files")
+            npz_skipped_multi_match += 1
+            if txt_file:
+                txt_skipped += 1
+            continue
+        
+        # Get the single matching webp
+        webp_path, webp_stem = matching_webps[0]
+        
+        # Extract random suffix from target webp
+        webp_random_suffix = extract_webp_random_suffix(webp_stem)
+        
+        # Construct new npz filename: matching_key + webp_random_suffix + npz_suffix
+        new_npz_name = f"{matching_key}{webp_random_suffix}{npz_suffix}"
+        
         # Destination paths
         dest_artist_dir = dest_root / artist_name
-        dest_npz_path = dest_artist_dir / npz_file.name
+        dest_npz_path = dest_artist_dir / new_npz_name
         
         # Ensure destination directory exists
         if not dest_artist_dir.exists():
@@ -243,33 +279,37 @@ def copy_npz_with_structure(
         # Copy npz file only if it doesn't exist in destination
         if npz_already_exists:
             if verbose:
-                tqdm.write(f"Skip npz (exists): {npz_file.name}")
-            npz_skipped += 1
+                tqdm.write(f"Skip npz (exists): {new_npz_name}")
+            npz_skipped_no_match += 1
         else:
             try:
                 if dry_run:
-                    tqdm.write(f"Would copy npz: {npz_file.name}")
+                    tqdm.write(f"Would copy npz: {npz_file.name} -> {new_npz_name}")
                     if verbose:
                         tqdm.write(f"  From: {npz_file}")
                         tqdm.write(f"  To:   {dest_npz_path}")
                 else:
-                    # Copy the npz file
+                    # Copy the npz file with new name
                     shutil.copy2(npz_file, dest_npz_path)
                     if verbose:
-                        tqdm.write(f"Copied npz: {npz_file.name} -> {dest_npz_path}")
+                        tqdm.write(f"Copied npz: {npz_file.name} -> {new_npz_name}")
                 
                 npz_copied += 1
                 
             except Exception as e:
                 tqdm.write(f"Error copying npz {npz_file.name}: {e}")
-                npz_skipped += 1
+                npz_skipped_no_match += 1
         
         # Always copy txt file if it exists (overwrite)
         if txt_file:
-            dest_txt_path = dest_artist_dir / txt_file.name
+            # Construct new txt filename based on new npz name (without _lumina.npz suffix)
+            new_txt_base = new_npz_name.replace('_lumina.npz', '')
+            new_txt_name = f"{new_txt_base}.txt"
+            dest_txt_path = dest_artist_dir / new_txt_name
+            
             try:
                 if dry_run:
-                    tqdm.write(f"Would copy txt: {txt_file.name}")
+                    tqdm.write(f"Would copy txt: {txt_file.name} -> {new_txt_name}")
                     if verbose:
                         tqdm.write(f"  From: {txt_file}")
                         tqdm.write(f"  To:   {dest_txt_path}")
@@ -277,7 +317,7 @@ def copy_npz_with_structure(
                     # Copy the txt file (overwrite if exists)
                     shutil.copy2(txt_file, dest_txt_path)
                     if verbose:
-                        tqdm.write(f"Copied txt: {txt_file.name} -> {dest_txt_path}")
+                        tqdm.write(f"Copied txt: {txt_file.name} -> {new_txt_name}")
                 
                 txt_copied += 1
                 
@@ -285,14 +325,16 @@ def copy_npz_with_structure(
                 tqdm.write(f"Error copying txt {txt_file.name}: {e}")
                 txt_skipped += 1
     
-    return npz_copied, npz_skipped, total_count, txt_copied, txt_skipped
+    return npz_copied, npz_skipped_no_match, npz_skipped_multi_match, total_count, txt_copied, txt_skipped
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Copy npz files from processed directory back to original output directory, "
-        "matching them with existing webp files. Also copies corresponding txt files. "
-        "NPZ files are skipped if they already exist in destination, but txt files are always copied."
+        "matching them with existing webp files using flexible prefix matching. "
+        "NPZ files are renamed to include the random suffix from target webp files. "
+        "Files with multiple matches are skipped. "
+        "TXT files are always copied with renamed filenames."
     )
     parser.add_argument(
         "--source-dir",
@@ -341,7 +383,7 @@ def main():
     print(f"Pattern: {args.pattern}")
     print()
     
-    npz_copied, npz_skipped, total_npz, txt_copied, txt_skipped = copy_npz_with_structure(
+    npz_copied, npz_skipped_no_match, npz_skipped_multi_match, total_npz, txt_copied, txt_skipped = copy_npz_with_structure(
         source_root=source_root,
         dest_root=dest_root,
         pattern=args.pattern,
@@ -354,9 +396,10 @@ def main():
     print("NPZ Files:")
     print(f"  Total found: {total_npz}")
     print(f"  Copied: {npz_copied}")
-    print(f"  Skipped: {npz_skipped}")
+    print(f"  Skipped (no match): {npz_skipped_no_match}")
+    print(f"  Skipped (multiple matches): {npz_skipped_multi_match}")
     
-    if npz_copied > 0:
+    if total_npz > 0:
         copy_rate = (npz_copied / total_npz) * 100
         print(f"  Copy rate: {copy_rate:.1f}%")
     
