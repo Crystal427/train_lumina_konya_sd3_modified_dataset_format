@@ -3,18 +3,22 @@ Copy npz files from processed directory back to original output directory.
 
 This script copies npz files (e.g., *_lumina.npz) from a processed directory
 back to the original output directory, preserving the artist folder structure.
-It matches npz files with their corresponding webp files by extracting the base name.
-It also copies corresponding txt files if they exist.
+It matches npz files with their corresponding webp files using a flexible matching rule:
+- If filename >= 50 chars: match first 50 characters
+- If filename < 50 chars: match everything before the last underscore
+
+The script renames npz files to include the random number from the target webp file.
 
 Features:
-- Copies npz files only if they don't already exist in destination
+- Matches files by prefix (first 50 chars or before last underscore)
+- Renames npz files to include target webp's random number
+- Skips files with multiple matches (ambiguous)
 - Always copies txt files, overwriting existing ones
-- Matches files by base name with webp files in destination
 
 Example:
-    Source: basename_1600x2607_lumina.npz, basename.txt
-    Matches: basename.webp in destination
-    Copies: basename_1600x2607_lumina.npz (if not exists), basename.txt (always)
+    Source: basename_12345.webp, basename_1600x2607_lumina.npz, basename.txt
+    Target: basename_67890.webp
+    Result: basename_67890_1600x2607_lumina.npz (renamed), basename.txt (copied)
 """
 
 import argparse
@@ -22,36 +26,82 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
+from collections import defaultdict
 
 from tqdm import tqdm
 
 
-def extract_base_name_from_npz(npz_filename: str) -> Optional[str]:
+def extract_matching_key(filename: str) -> str:
     """
-    Extract base name from npz filename.
+    Extract matching key from filename for pairing.
     
-    Example:
-        gelbooru_8904448_47d23a5c3cd05d1e094b4e465a0ed1e3_R73Pq6Cs_1600x2607_lumina.npz
-        -> gelbooru_8904448_47d23a5c3cd05d1e094b4e465a0ed1e3_R73Pq6Cs
+    Rules:
+    - If filename >= 50 chars: return first 50 characters
+    - If filename < 50 chars: return everything before the last underscore
+    
+    Args:
+        filename: Name of the file (without extension)
+        
+    Returns:
+        Matching key for pairing
+    """
+    if len(filename) >= 50:
+        return filename[:50]
+    else:
+        # Find last underscore and return everything before it
+        last_underscore_idx = filename.rfind('_')
+        if last_underscore_idx > 0:
+            return filename[:last_underscore_idx]
+        else:
+            # No underscore found, return the whole filename
+            return filename
+
+
+def extract_npz_suffix(npz_filename: str) -> Optional[str]:
+    """
+    Extract the suffix part from npz filename (e.g., _1600x2607_lumina.npz).
     
     Args:
         npz_filename: Name of the npz file
         
     Returns:
-        Base name without resolution and suffix, or None if pattern doesn't match
+        Suffix part (including leading underscore) or None if pattern doesn't match
     """
-    # Pattern: basename_WIDTHxHEIGHT_lumina.npz
-    pattern = r'^(.+?)_\d+x\d+_lumina\.npz$'
-    match = re.match(pattern, npz_filename)
+    # Pattern: _WIDTHxHEIGHT_lumina.npz or _xxx_lumina.npz
+    pattern = r'(_\d+x\d+_lumina\.npz)$'
+    match = re.search(pattern, npz_filename)
     
     if match:
         return match.group(1)
     
+    # Try alternative pattern: _xxx_lumina.npz
+    pattern2 = r'(_.+?_lumina\.npz)$'
+    match2 = re.search(pattern2, npz_filename)
+    if match2:
+        return match2.group(1)
+    
     return None
 
 
-def build_webp_index(dest_root: Path) -> Dict[str, Path]:
+def extract_webp_random_suffix(webp_filename: str) -> Optional[str]:
+    """
+    Extract the random number suffix from webp filename (e.g., _67890 from basename_67890.webp).
+    
+    Args:
+        webp_filename: Name of the webp file (without extension)
+        
+    Returns:
+        Random suffix (including leading underscore) or empty string if no suffix
+    """
+    # Extract everything after the matching key
+    matching_key = extract_matching_key(webp_filename)
+    if len(webp_filename) > len(matching_key):
+        return webp_filename[len(matching_key):]
+    return ""
+
+
+def build_webp_index(dest_root: Path) -> Dict[str, List[Tuple[Path, str]]]:
     """
     Build an index of all webp files in destination directory.
     
@@ -59,9 +109,9 @@ def build_webp_index(dest_root: Path) -> Dict[str, Path]:
         dest_root: Destination root directory
         
     Returns:
-        Dictionary mapping (artist_name, base_name) -> webp_file_path
+        Dictionary mapping (artist_name, matching_key) -> [(webp_file_path, webp_stem), ...]
     """
-    webp_index: Dict[str, Path] = {}
+    webp_index: Dict[str, List[Tuple[Path, str]]] = defaultdict(list)
     
     if not dest_root.exists():
         return webp_index
@@ -72,9 +122,10 @@ def build_webp_index(dest_root: Path) -> Dict[str, Path]:
         
         for webp_file in artist_dir.glob("*.webp"):
             if webp_file.is_file():
-                base_name = webp_file.stem  # filename without extension
-                key = f"{artist_dir.name}/{base_name}"
-                webp_index[key] = webp_file
+                webp_stem = webp_file.stem  # filename without extension
+                matching_key = extract_matching_key(webp_stem)
+                key = f"{artist_dir.name}/{matching_key}"
+                webp_index[key].append((webp_file, webp_stem))
     
     return webp_index
 

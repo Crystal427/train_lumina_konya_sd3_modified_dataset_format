@@ -1,8 +1,10 @@
 import argparse
 import json
 import os
+import random
 import re
 import shutil
+import string
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -35,11 +37,18 @@ FILTER_FEATURE_KEYS = {
     "transparent_background",
 }
 FEATURES_THRESHOLD_DEFAULT = 0.27
+MAX_FILENAME_LENGTH = 60  # Maximum filename length (excluding extension)
 
 
 # ----------------------------
 # Utility helpers
 # ----------------------------
+def generate_random_suffix(length: int = 6) -> str:
+    """Generate a random alphanumeric suffix."""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
 def safe_read_json(json_path: Path) -> Optional[dict]:
     try:
         if json_path.exists():
@@ -867,29 +876,50 @@ def choose_unique_output_name(
     original_extension: Optional[str] = None,
     used_names: Optional[Set[str]] = None,
 ) -> str:
+    """
+    Generate a unique output filename with length constraints.
+    
+    - Limits filename (without extension) to MAX_FILENAME_LENGTH characters
+    - Adds random 6-character suffix to avoid collisions
+    - Ensures uniqueness by checking filesystem and used_names set
+    """
     if metadata_only:
         extension = original_extension if original_extension else ""
     else:
         extension = ".webp"
 
-    def build_candidate(counter: int) -> str:
-        suffix = "" if counter == 1 else f"_{counter}"
-        return f"{base_name}{suffix}{extension}"
-
-    counter = 1
-    while True:
-        candidate = build_candidate(counter)
-        if metadata_only:
-            if used_names is None or candidate not in used_names:
-                if used_names is not None:
-                    used_names.add(candidate)
-                return candidate
-        else:
-            if not (dst_artist_dir / candidate).exists():
-                if used_names is not None:
-                    used_names.add(candidate)
-                return candidate
-        counter += 1
+    # Calculate max base name length (total 60 - "_" - 6 random chars)
+    max_base_length = MAX_FILENAME_LENGTH - 7  # Reserve space for "_XXXXXX"
+    
+    # Truncate base_name if too long
+    if len(base_name) > max_base_length:
+        base_name = base_name[:max_base_length]
+    
+    # Try to generate a unique name
+    max_attempts = 1000
+    for _ in range(max_attempts):
+        random_suffix = generate_random_suffix(6)
+        candidate = f"{base_name}_{random_suffix}{extension}"
+        
+        # Check uniqueness
+        is_unique = True
+        if used_names is not None and candidate in used_names:
+            is_unique = False
+        if not metadata_only and (dst_artist_dir / candidate).exists():
+            is_unique = False
+            
+        if is_unique:
+            if used_names is not None:
+                used_names.add(candidate)
+            return candidate
+    
+    # Fallback: use timestamp if all random attempts failed
+    import time
+    timestamp_suffix = str(int(time.time() * 1000000) % 1000000).zfill(6)
+    candidate = f"{base_name}_{timestamp_suffix}{extension}"
+    if used_names is not None:
+        used_names.add(candidate)
+    return candidate
 
 
 def build_image_payload(
@@ -1089,6 +1119,7 @@ def process_artist(
     def handle_one(index_value: int, year_name: str, file_path: Path) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         try:
             stem = file_path.stem
+            # Generate unique output filename with length constraints
             assigned_name = choose_unique_output_name(
                 dst_artist_dir=dst_artist_dir,
                 base_name=stem,
@@ -1096,7 +1127,9 @@ def process_artist(
                 original_extension=file_path.suffix,
                 used_names=used_names,
             )
-            record, out_img_name, err = build_image_payload(
+            
+            # Build metadata payload with the assigned output filename
+            record, _, err = build_image_payload(
                 nl_root=nl_root,
                 artist_dir=artist_dir,
                 dst_artist_dir=dst_artist_dir,
@@ -1111,14 +1144,15 @@ def process_artist(
             if err:
                 return False, None, f"{file_path.name}: {err}"
 
+            # Use assigned_name consistently for file operations
             if not metadata_only:
-                out_img_path = dst_artist_dir / out_img_name
+                out_img_path = dst_artist_dir / assigned_name
                 
                 # Check if cached file exists
                 cached_file_copied = False
                 if cache_dir is not None:
                     cache_artist_dir = cache_dir / artist_dir.name
-                    cached_img_path = cache_artist_dir / out_img_name
+                    cached_img_path = cache_artist_dir / assigned_name
                     if cached_img_path.exists() and cached_img_path.is_file():
                         try:
                             shutil.copy2(cached_img_path, out_img_path)
@@ -1132,7 +1166,8 @@ def process_artist(
                     if not ok:
                         return False, None, f"{file_path.name}: failed to save webp"
 
-            return True, record, out_img_name
+            # Ensure the returned filename matches what was actually used
+            return True, record, assigned_name
         except Exception as e:
             return False, None, f"{file_path.name}: {e}"
 
