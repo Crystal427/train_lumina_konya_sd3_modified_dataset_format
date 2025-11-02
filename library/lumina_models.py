@@ -23,6 +23,13 @@ import math
 import os
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+import torch.nn as nn
+import torch.nn.functional as F
+
 from library import custom_offloading_utils
 
 disable_selective_torch_compile = (
