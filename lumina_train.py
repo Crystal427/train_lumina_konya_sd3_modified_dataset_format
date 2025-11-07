@@ -191,11 +191,14 @@ def train(args):
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
-    # Fix for DDP unused parameters error when text encoder is frozen
-    # Set find_unused_parameters=True for DistributedDataParallel
-    from accelerate.utils import DistributedDataParallelKwargs
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = train_util.prepare_accelerator(args, kwargs_handlers=[ddp_kwargs])
+    # Lumina always freezes text encoder, so we need to enable find_unused_parameters for DDP
+    # This prevents "Expected to have finished reduction" error in multi-GPU training
+    if not hasattr(args, 'ddp_find_unused_parameters'):
+        args.ddp_find_unused_parameters = True
+    elif args.ddp_find_unused_parameters is None:
+        args.ddp_find_unused_parameters = True
+    
+    accelerator = train_util.prepare_accelerator(args)
 
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)

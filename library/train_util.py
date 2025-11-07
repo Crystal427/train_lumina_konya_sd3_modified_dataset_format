@@ -4531,6 +4531,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
     parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action="store_true",
+        help="enable find_unused_parameters for DDP (required when some parameters are frozen) / DDPでfind_unused_parametersを有効にする（一部パラメータが凍結されている場合に必要）",
+    )
+    parser.add_argument(
         "--clip_skip",
         type=int,
         default=None,
@@ -6015,9 +6020,11 @@ def prepare_accelerator(args: argparse.Namespace):
         ),
         (
             DistributedDataParallelKwargs(
-                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
+                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+                static_graph=args.ddp_static_graph,
+                find_unused_parameters=args.ddp_find_unused_parameters,
             )
-            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph
+            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph or args.ddp_find_unused_parameters
             else None
         ),
     ]
