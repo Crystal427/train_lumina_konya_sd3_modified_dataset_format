@@ -310,7 +310,7 @@ def analyze_image_for_danbooru(
     results_json: Optional[dict],
     quality_labels_for_artist: Optional[Dict[str, str]],
     features_threshold: float,
-) -> DanbooruComponents:
+) -> Tuple[DanbooruComponents, Optional[str]]:
     name, _ = os.path.splitext(filename)
 
     # Resolve source path (handle new/Augmentation)
@@ -507,7 +507,7 @@ def analyze_image_for_danbooru(
         final_rating_tag=final_rating_tag,
         additional_tags=additional_tags,
         aes_rating=aes_rating,
-    )
+    ), finaltag_dan_from_txt
 
 
 def compose_danbooru_metadata(
@@ -943,7 +943,7 @@ def build_image_payload(
         os.path.join("Augmentation", base_name) if "Augmentation" in img_path.parts else base_name
     )
 
-    components = analyze_image_for_danbooru(
+    components, txt_override = analyze_image_for_danbooru(
         artist_folder=artist_dir,
         year_folder_name=year_name,
         filename=filename_for_analysis,
@@ -951,7 +951,17 @@ def build_image_payload(
         quality_labels_for_artist=quality_labels_for_artist,
         features_threshold=features_threshold,
     )
-    danbooru_meta = compose_danbooru_metadata(components, final_artist_tag)
+    
+    # If txt file exists with content, use it directly as danbooru tag
+    if txt_override:
+        danbooru_meta = {
+            "prefix": None,
+            "suffix": None,
+            "finaltag_dan": txt_override,
+            "prompt_body": txt_override,
+        }
+    else:
+        danbooru_meta = compose_danbooru_metadata(components, final_artist_tag)
 
     results_entry = results_json.get(base_name) if results_json and base_name in results_json else {}
     finaltag_native = None

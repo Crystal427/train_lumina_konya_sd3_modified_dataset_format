@@ -191,7 +191,11 @@ def train(args):
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
-    accelerator = train_util.prepare_accelerator(args)
+    # Fix for DDP unused parameters error when text encoder is frozen
+    # Set find_unused_parameters=True for DistributedDataParallel
+    from accelerate.utils import DistributedDataParallelKwargs
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = train_util.prepare_accelerator(args, kwargs_handlers=[ddp_kwargs])
 
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
